@@ -1,0 +1,13 @@
+encore.gen.go
+/.encore
+/encore.gen
+
+# Personal interview prep notes
+/docs/DESIGN_DECISIONS_QA.md
+/docs/TECHNOLOGY_INTERVIEW_PRIMER.md
+/docs/MOCK_INTERVIEW_SCRIPT.md
+/docs/INTERVIEW_CHEAT_SHEET.md
+.envrc
+
+# Build artifacts
+/fees-worker
