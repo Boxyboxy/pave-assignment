@@ -11,11 +11,11 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Request validation
+// Request parsing
 // ---------------------------------------------------------------------------
 
-// validateCreateBillRequest checks required fields and returns the normalised period_end.
-func validateCreateBillRequest(req *CreateBillRequest, now time.Time) (time.Time, error) {
+// parseCreateBillRequest validates required fields and returns the normalised period_end.
+func parseCreateBillRequest(req *CreateBillRequest, now time.Time) (time.Time, error) {
 	if req == nil {
 		return time.Time{}, fmt.Errorf("missing request body")
 	}
@@ -42,9 +42,9 @@ func validateCreateBillRequest(req *CreateBillRequest, now time.Time) (time.Time
 	return periodEnd, nil
 }
 
-// validateAddLineItemRequest checks required fields and returns the parsed bill UUID
+// parseAddLineItemRequest validates required fields and returns the parsed bill UUID
 // and a SHA-256 payload hash used for idempotency verification.
-func validateAddLineItemRequest(billID string, req *AddLineItemRequest) (uuid.UUID, string, error) {
+func parseAddLineItemRequest(billID string, req *AddLineItemRequest) (uuid.UUID, string, error) {
 	if req == nil {
 		return uuid.Nil, "", fmt.Errorf("missing request body")
 	}
@@ -68,10 +68,6 @@ func validateAddLineItemRequest(billID string, req *AddLineItemRequest) (uuid.UU
 	}
 	return id, computeLineItemPayloadHash(req.Description, int64(req.AmountMinor)), nil
 }
-
-// ---------------------------------------------------------------------------
-// Parsing helpers
-// ---------------------------------------------------------------------------
 
 // parseBillStatusFilter converts an optional status string to a typed BillStatus pointer.
 func parseBillStatusFilter(status *string) (*BillStatus, error) {
@@ -100,7 +96,6 @@ func parseBillID(billID string) (uuid.UUID, error) {
 // ---------------------------------------------------------------------------
 // Payload hashing
 // ---------------------------------------------------------------------------
-
 // computeLineItemPayloadHash produces a deterministic SHA-256 hash of the
 // line-item payload, used to detect conflicting idempotent retries.
 func computeLineItemPayloadHash(description string, amountMinor int64) string {

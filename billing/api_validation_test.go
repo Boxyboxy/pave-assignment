@@ -25,18 +25,18 @@ func TestCurrencyValidate(t *testing.T) {
 func TestCreateBillValidation(t *testing.T) {
 	t.Parallel()
 	now := time.Now().UTC()
-	if _, err := validateCreateBillRequest(nil, now); err == nil {
+	if _, err := parseCreateBillRequest(nil, now); err == nil {
 		t.Fatalf("expected nil request error")
 	}
 	// Missing account_id
-	if _, err := validateCreateBillRequest(&CreateBillRequest{
+	if _, err := parseCreateBillRequest(&CreateBillRequest{
 		Currency:  CurrencyUSD,
 		PeriodEnd: now.Add(time.Hour),
 	}, now); err == nil {
 		t.Fatalf("expected missing account_id error")
 	}
 	// account_id too long
-	if _, err := validateCreateBillRequest(&CreateBillRequest{
+	if _, err := parseCreateBillRequest(&CreateBillRequest{
 		AccountID: strings.Repeat("a", 201),
 		Currency:  CurrencyUSD,
 		PeriodEnd: now.Add(time.Hour),
@@ -44,7 +44,7 @@ func TestCreateBillValidation(t *testing.T) {
 		t.Fatalf("expected account_id too long error")
 	}
 	// Unsupported currency
-	if _, err := validateCreateBillRequest(&CreateBillRequest{
+	if _, err := parseCreateBillRequest(&CreateBillRequest{
 		AccountID: "acct-1",
 		Currency:  Currency("EUR"),
 		PeriodEnd: now.Add(time.Hour),
@@ -52,7 +52,7 @@ func TestCreateBillValidation(t *testing.T) {
 		t.Fatalf("expected unsupported currency error")
 	}
 	// Period end in the past
-	if _, err := validateCreateBillRequest(&CreateBillRequest{
+	if _, err := parseCreateBillRequest(&CreateBillRequest{
 		AccountID: "acct-1",
 		Currency:  CurrencyUSD,
 		PeriodEnd: now.Add(-time.Minute),
@@ -60,7 +60,7 @@ func TestCreateBillValidation(t *testing.T) {
 		t.Fatalf("expected past period_end error")
 	}
 	// Period end too far in the future
-	if _, err := validateCreateBillRequest(&CreateBillRequest{
+	if _, err := parseCreateBillRequest(&CreateBillRequest{
 		AccountID: "acct-1",
 		Currency:  CurrencyUSD,
 		PeriodEnd: now.Add(366 * 24 * time.Hour),
@@ -68,7 +68,7 @@ func TestCreateBillValidation(t *testing.T) {
 		t.Fatalf("expected too-far-in-future period_end error")
 	}
 	// Zero period_end
-	if _, err := validateCreateBillRequest(&CreateBillRequest{
+	if _, err := parseCreateBillRequest(&CreateBillRequest{
 		AccountID: "acct-1",
 		Currency:  CurrencyUSD,
 		PeriodEnd: time.Time{},
@@ -76,7 +76,7 @@ func TestCreateBillValidation(t *testing.T) {
 		t.Fatalf("expected zero period_end error")
 	}
 	// Valid request
-	if _, err := validateCreateBillRequest(&CreateBillRequest{
+	if _, err := parseCreateBillRequest(&CreateBillRequest{
 		AccountID: "acct-1",
 		Currency:  CurrencyUSD,
 		PeriodEnd: now.Add(5 * time.Minute),
@@ -89,7 +89,7 @@ func TestCreateBillValidation(t *testing.T) {
 		Currency:  CurrencyUSD,
 		PeriodEnd: now.Add(5 * time.Minute),
 	}
-	if _, err := validateCreateBillRequest(req, now); err != nil {
+	if _, err := parseCreateBillRequest(req, now); err != nil {
 		t.Fatalf("expected valid create bill request, got %v", err)
 	}
 	if req.AccountID != "acct-1" {
@@ -99,51 +99,51 @@ func TestCreateBillValidation(t *testing.T) {
 
 func TestAddLineItemValidation(t *testing.T) {
 	t.Parallel()
-	if _, _, err := validateAddLineItemRequest("not-a-uuid", nil); err == nil {
+	if _, _, err := parseAddLineItemRequest("not-a-uuid", nil); err == nil {
 		t.Fatalf("expected nil request error")
 	}
-	if _, _, err := validateAddLineItemRequest("not-a-uuid", &AddLineItemRequest{
+	if _, _, err := parseAddLineItemRequest("not-a-uuid", &AddLineItemRequest{
 		Description: "fee",
 		AmountMinor: 100,
 	}); err == nil {
 		t.Fatalf("expected invalid bill id error")
 	}
 	validID := "8cbf374a-7b61-4d03-8ff8-e46265d66abc"
-	if _, _, err := validateAddLineItemRequest(validID, &AddLineItemRequest{
+	if _, _, err := parseAddLineItemRequest(validID, &AddLineItemRequest{
 		Description: " ",
 		AmountMinor: 100,
 	}); err == nil {
 		t.Fatalf("expected empty description error")
 	}
-	if _, _, err := validateAddLineItemRequest(validID, &AddLineItemRequest{
+	if _, _, err := parseAddLineItemRequest(validID, &AddLineItemRequest{
 		Description: "fee",
 		AmountMinor: 0,
 	}); err == nil {
 		t.Fatalf("expected zero amount error")
 	}
 	// Negative amount
-	if _, _, err := validateAddLineItemRequest(validID, &AddLineItemRequest{
+	if _, _, err := parseAddLineItemRequest(validID, &AddLineItemRequest{
 		Description:    "fee",
 		AmountMinor:    -100,
 		IdempotencyKey: "key-1",
 	}); err == nil {
 		t.Fatalf("expected negative amount error")
 	}
-	if _, _, err := validateAddLineItemRequest(validID, &AddLineItemRequest{
+	if _, _, err := parseAddLineItemRequest(validID, &AddLineItemRequest{
 		Description: "fee",
 		AmountMinor: 100,
 	}); err == nil {
 		t.Fatalf("expected missing idempotency key error")
 	}
 	// Whitespace-only idempotency key
-	if _, _, err := validateAddLineItemRequest(validID, &AddLineItemRequest{
+	if _, _, err := parseAddLineItemRequest(validID, &AddLineItemRequest{
 		Description:    "fee",
 		AmountMinor:    100,
 		IdempotencyKey: "   ",
 	}); err == nil {
 		t.Fatalf("expected whitespace-only idempotency key error")
 	}
-	if _, _, err := validateAddLineItemRequest(validID, &AddLineItemRequest{
+	if _, _, err := parseAddLineItemRequest(validID, &AddLineItemRequest{
 		Description:    "fee",
 		AmountMinor:    100,
 		IdempotencyKey: strings.Repeat("x", 201),
@@ -155,7 +155,7 @@ func TestAddLineItemValidation(t *testing.T) {
 		AmountMinor:    100,
 		IdempotencyKey: "  key-1  ",
 	}
-	if _, payloadHash, err := validateAddLineItemRequest(validID, req); err != nil {
+	if _, payloadHash, err := parseAddLineItemRequest(validID, req); err != nil {
 		t.Fatalf("expected valid request, got %v", err)
 	} else if payloadHash == "" {
 		t.Fatalf("expected non-empty payload hash")

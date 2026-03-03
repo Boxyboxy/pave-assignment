@@ -24,13 +24,13 @@ type CreateBillRequest struct {
 	PeriodEnd time.Time `json:"period_end"`
 }
 
-// CreateBill creates a new bill, inserts it into the DB, and starts the
-// corresponding Temporal billing workflow.
+// CreateBill creates a new bill, inserts it into the DB (synchronous), and starts the
+// corresponding Temporal billing workflow (fire and forget).
 //
 //encore:api public method=POST path=/bills
 func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Bill, error) {
 	now := time.Now().UTC()
-	periodEnd, err := validateCreateBillRequest(req, now)
+	periodEnd, err := parseCreateBillRequest(req, now)
 	if err != nil {
 		return nil, errs.B().Code(errs.InvalidArgument).Msg(err.Error()).Err()
 	}
@@ -87,7 +87,6 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Bill
 // ---------------------------------------------------------------------------
 // Add line item (write delegated to Temporal workflow via Update)
 // ---------------------------------------------------------------------------
-
 // AddLineItemRequest is the payload for adding a line item to an open bill.
 type AddLineItemRequest struct {
 	Description    string    `json:"description"`
@@ -103,10 +102,11 @@ type AddLineItemResponse struct {
 
 // AddLineItem delegates line-item creation to the Temporal workflow via Update,
 // ensuring durable persistence and idempotency.
+// Using Temporal Updates (synchronous counterpart to Signals).
 //
 //encore:api public method=POST path=/bills/:billID/items
 func (s *Service) AddLineItem(ctx context.Context, billID string, req *AddLineItemRequest) (*AddLineItemResponse, error) {
-	id, payloadHash, err := validateAddLineItemRequest(billID, req)
+	id, payloadHash, err := parseAddLineItemRequest(billID, req)
 	if err != nil {
 		return nil, errs.B().Code(errs.InvalidArgument).Msg(err.Error()).Err()
 	}
@@ -131,7 +131,6 @@ func (s *Service) AddLineItem(ctx context.Context, billID string, req *AddLineIt
 // ---------------------------------------------------------------------------
 // Close bill (write delegated to Temporal workflow via Signal)
 // ---------------------------------------------------------------------------
-
 // UpdateBillRequest is the payload for updating a bill (currently only closing).
 type UpdateBillRequest struct {
 	Status string `json:"status"`
