@@ -11,3 +11,4 @@ encore.gen.go
 
 # Build artifacts
 /fees-worker
+encore.gen.cue

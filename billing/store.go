@@ -22,9 +22,12 @@ var billingDB = sqldb.NewDatabase("billing", sqldb.DatabaseConfig{
 // Bill columns constant (used by all bill queries)
 // ---------------------------------------------------------------------------
 
+// billColumns defines the canonical SELECT column list for bills.
+// IMPORTANT: scanBill below MUST match this column order exactly.
 const billColumns = "id, account_id, currency, status, created_at, updated_at, period_start, period_end, closed_at, total_minor"
 
-// scanBill scans a row with the standard bill column set into a Bill struct.
+// scanBill scans a row that was selected with billColumns into a Bill struct.
+// Keep column order in sync with billColumns above.
 func scanBill(row interface{ Scan(dest ...any) error }) (*Bill, error) {
 	var (
 		id          uuid.UUID
@@ -55,7 +58,7 @@ func scanBill(row interface{ Scan(dest ...any) error }) (*Bill, error) {
 		PeriodStart: periodStart,
 		PeriodEnd:   periodEnd,
 		ClosedAt:    closedAtPtr,
-		TotalMinor:  totalMinor,
+		TotalMinor:  MinorUnit(totalMinor),
 	}, nil
 }
 
@@ -73,26 +76,26 @@ type createBillParams struct {
 }
 
 func createBill(ctx context.Context, p createBillParams) (*Bill, error) {
-	now := time.Now().UTC()
-	b := &Bill{
+	var createdAt, updatedAt time.Time
+	err := billingDB.QueryRow(ctx, `
+		INSERT INTO bills (id, account_id, currency, status, created_at, updated_at, period_start, period_end, total_minor, workflow_id)
+		VALUES ($1, $2, $3, 'OPEN', NOW(), NOW(), $4, $5, 0, $6)
+		RETURNING created_at, updated_at
+	`, p.ID, p.AccountID, string(p.Currency), p.PeriodStart, p.PeriodEnd, p.WorkflowID).Scan(&createdAt, &updatedAt)
+	if err != nil {
+		return nil, errs.Wrap(err, "insert bill")
+	}
+	return &Bill{
 		ID:          p.ID.String(),
 		AccountID:   p.AccountID,
 		Currency:    p.Currency,
 		Status:      BillStatusOpen,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		CreatedAt:   createdAt,
+		UpdatedAt:   updatedAt,
 		PeriodStart: p.PeriodStart,
 		PeriodEnd:   p.PeriodEnd,
 		TotalMinor:  0,
-	}
-	_, err := billingDB.Exec(ctx, `
-		INSERT INTO bills (id, account_id, currency, status, created_at, updated_at, period_start, period_end, total_minor, workflow_id)
-		VALUES ($1, $2, $3, 'OPEN', $4, $4, $5, $6, 0, $7)
-	`, p.ID, p.AccountID, string(p.Currency), b.CreatedAt, b.PeriodStart, b.PeriodEnd, p.WorkflowID)
-	if err != nil {
-		return nil, errs.Wrap(err, "insert bill")
-	}
-	return b, nil
+	}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -124,201 +127,10 @@ func cancelBill(ctx context.Context, billID uuid.UUID) error {
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// Add line item
-// ---------------------------------------------------------------------------
-
-type addLineItemParams struct {
-	BillID         uuid.UUID
-	Description    string
-	AmountMinor    int64
-	IdempotencyKey string
-	PayloadHash    string
-}
-
-type addLineItemResult struct {
-	Item LineItem
-	Bill Bill
-}
-
-func addLineItem(ctx context.Context, p addLineItemParams) (*addLineItemResult, error) {
-	if p.IdempotencyKey == "" {
-		return nil, errs.B().Code(errs.InvalidArgument).Msg("idempotency_key is required").Err()
-	}
-	if p.PayloadHash == "" {
-		return nil, errs.B().Code(errs.InvalidArgument).Msg("payload hash is required").Err()
-	}
-
-	tx, err := billingDB.Begin(ctx)
-	if err != nil {
-		return nil, errs.Wrap(err, "begin tx")
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	var (
-		accountID   string
-		currency    string
-		status      string
-		createdAt   time.Time
-		updatedAt   time.Time
-		periodStart time.Time
-		periodEnd   time.Time
-		closedAt    sql.NullTime
-		totalMinor  int64
-	)
-	err = tx.QueryRow(ctx, `
-		SELECT account_id, currency, status, created_at, updated_at, period_start, period_end, closed_at, total_minor
-		FROM bills WHERE id = $1
-		FOR UPDATE
-	`, p.BillID).Scan(&accountID, &currency, &status, &createdAt, &updatedAt, &periodStart, &periodEnd, &closedAt, &totalMinor)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errs.B().Code(errs.NotFound).Msg("bill not found").Err()
-		}
-		return nil, errs.Wrap(err, "load bill")
-	}
-	if status != string(BillStatusOpen) {
-		return nil, errs.B().Code(errs.FailedPrecondition).Msgf("bill is %s", status).Err()
-	}
-
-	itemID := uuid.New()
-	itemCreatedAt := time.Now().UTC()
-	var inserted bool
-
-	var returnedID uuid.UUID
-	err = tx.QueryRow(ctx, `
-		INSERT INTO line_items (id, bill_id, idempotency_key, payload_hash, description, amount_minor, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (bill_id, idempotency_key) DO NOTHING
-		RETURNING id
-	`, itemID, p.BillID, p.IdempotencyKey, p.PayloadHash, p.Description, p.AmountMinor, itemCreatedAt).Scan(&returnedID)
-	if err == nil {
-		inserted = true
-		itemID = returnedID
-	} else if errors.Is(err, sql.ErrNoRows) {
-		var (
-			existingDesc    string
-			existingAmount  int64
-			existingCreated time.Time
-			storedHash      string
-		)
-		err = tx.QueryRow(ctx, `
-			SELECT id, description, amount_minor, created_at, payload_hash
-			FROM line_items WHERE bill_id = $1 AND idempotency_key = $2
-		`, p.BillID, p.IdempotencyKey).Scan(&returnedID, &existingDesc, &existingAmount, &existingCreated, &storedHash)
-		if err != nil {
-			return nil, errs.Wrap(err, "load existing line item")
-		}
-		// Backward-compatible path for pre-hash rows migrated with empty payload_hash.
-		if storedHash == "" {
-			if _, err := tx.Exec(ctx, `
-				UPDATE line_items SET payload_hash = $3
-				WHERE bill_id = $1 AND idempotency_key = $2
-			`, p.BillID, p.IdempotencyKey, p.PayloadHash); err != nil {
-				return nil, errs.Wrap(err, "backfill line item payload hash")
-			}
-			storedHash = p.PayloadHash
-		}
-		if storedHash != p.PayloadHash {
-			return nil, errs.B().Code(errs.AlreadyExists).Msg("idempotency_key already used with different payload").Err()
-		}
-		itemID = returnedID
-		// Use the stored values for the response (not the incoming params).
-		p.Description = existingDesc
-		p.AmountMinor = existingAmount
-		itemCreatedAt = existingCreated
-		inserted = false
-	} else {
-		return nil, errs.Wrap(err, "insert line item")
-	}
-
-	if inserted {
-		err = tx.QueryRow(ctx, `
-			UPDATE bills SET total_minor = total_minor + $2, updated_at = NOW()
-			WHERE id = $1
-			RETURNING total_minor, updated_at
-		`, p.BillID, p.AmountMinor).Scan(&totalMinor, &updatedAt)
-		if err != nil {
-			return nil, errs.Wrap(err, "update bill total")
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, errs.Wrap(err, "commit tx")
-	}
-
-	var closedAtPtr *time.Time
-	if closedAt.Valid {
-		closedAtPtr = &closedAt.Time
-	}
-	return &addLineItemResult{
-		Item: LineItem{
-			ID:             itemID.String(),
-			BillID:         p.BillID.String(),
-			IdempotencyKey: optionalString(p.IdempotencyKey),
-			Description:    p.Description,
-			AmountMinor:    p.AmountMinor,
-			CreatedAt:      itemCreatedAt,
-		},
-		Bill: Bill{
-			ID:          p.BillID.String(),
-			AccountID:   accountID,
-			Currency:    Currency(currency),
-			Status:      BillStatus(status),
-			CreatedAt:   createdAt,
-			UpdatedAt:   updatedAt,
-			PeriodStart: periodStart,
-			PeriodEnd:   periodEnd,
-			ClosedAt:    closedAtPtr,
-			TotalMinor:  totalMinor,
-		},
-	}, nil
-}
-
-// ---------------------------------------------------------------------------
-// Close bill (delegates mutation to shared workflowdef.CloseBillInDB)
-// ---------------------------------------------------------------------------
-
-func closeBill(ctx context.Context, billID uuid.UUID) (*Bill, error) {
-	tx, err := billingDB.Begin(ctx)
-	if err != nil {
-		return nil, errs.Wrap(err, "begin tx")
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Lock the bill row to serialize with concurrent addLineItem transactions.
-	var status string
-	err = tx.QueryRow(ctx, `SELECT status FROM bills WHERE id = $1 FOR UPDATE`, billID).Scan(&status)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errs.B().Code(errs.NotFound).Msg("bill not found").Err()
-		}
-		return nil, errs.Wrap(err, "lock bill for close")
-	}
-
-	if status == string(BillStatusOpen) {
-		_, err = tx.Exec(ctx, `
-			UPDATE bills SET status = 'CLOSED', closed_at = NOW(), updated_at = NOW()
-			WHERE id = $1
-		`, billID)
-		if err != nil {
-			return nil, errs.Wrap(err, "update bill status to closed")
-		}
-	}
-	// If already CLOSED or CANCELLED, no-op (idempotent).
-
-	row := tx.QueryRow(ctx, `SELECT `+billColumns+` FROM bills WHERE id = $1`, billID)
-	b, err := scanBill(row)
-	if err != nil {
-		return nil, errs.Wrap(err, "read bill after close")
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, errs.Wrap(err, "commit close tx")
-	}
-
-	return b, nil
-}
+// NOTE: addLineItem and closeBill writes are now delegated to the Temporal
+// worker via activities (PersistLineItem and MarkClosedInDB). The API layer
+// communicates with the workflow through Updates (add-line-item) and Signals
+// (close-bill). Only pure DB reads remain in the API service.
 
 // ---------------------------------------------------------------------------
 // Get bill
@@ -336,18 +148,6 @@ func getBill(ctx context.Context, billID uuid.UUID) (*Bill, error) {
 		return nil, errs.Wrap(err, "load bill")
 	}
 	return b, nil
-}
-
-func getBillWorkflowID(ctx context.Context, billID uuid.UUID) (string, error) {
-	var workflowID string
-	err := billingDB.QueryRow(ctx, `SELECT workflow_id FROM bills WHERE id = $1`, billID).Scan(&workflowID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", errs.B().Code(errs.NotFound).Msg("bill not found").Err()
-		}
-		return "", errs.Wrap(err, "load bill workflow id")
-	}
-	return workflowID, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +168,7 @@ type listBillsParams struct {
 
 func listBills(ctx context.Context, p listBillsParams) ([]Bill, int, error) {
 	// Build WHERE clause dynamically with parameterised values.
+	// NOTE: hand-rolled arg-index tracking; consider squirrel or sqlc if filter count grows.
 	var where []string
 	var args []interface{}
 	argIdx := 1
@@ -467,7 +268,7 @@ func listLineItems(ctx context.Context, billID uuid.UUID) ([]LineItem, error) {
 		var (
 			id          uuid.UUID
 			bid         uuid.UUID
-			idemKey     sql.NullString
+			idemKey     string
 			description string
 			amountMinor int64
 			createdAt   time.Time
@@ -475,16 +276,12 @@ func listLineItems(ctx context.Context, billID uuid.UUID) ([]LineItem, error) {
 		if err := rows.Scan(&id, &bid, &idemKey, &description, &amountMinor, &createdAt); err != nil {
 			return nil, errs.Wrap(err, "scan line item")
 		}
-		var keyPtr *string
-		if idemKey.Valid {
-			keyPtr = &idemKey.String
-		}
 		items = append(items, LineItem{
 			ID:             id.String(),
 			BillID:         bid.String(),
-			IdempotencyKey: keyPtr,
+			IdempotencyKey: idemKey,
 			Description:    description,
-			AmountMinor:    amountMinor,
+			AmountMinor:    MinorUnit(amountMinor),
 			CreatedAt:      createdAt,
 		})
 	}
@@ -492,15 +289,4 @@ func listLineItems(ctx context.Context, billID uuid.UUID) ([]LineItem, error) {
 		return nil, errs.Wrap(err, "rows error")
 	}
 	return items, nil
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-func optionalString(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
 }

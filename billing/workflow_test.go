@@ -27,6 +27,13 @@ func TestBillingWorkflow_ClosesOnSignal(t *testing.T) {
 		invoiceCalls++
 		return nil
 	}, activity.RegisterOptions{Name: workflowdef.SendInvoiceActivityName})
+	env.RegisterActivityWithOptions(
+		func(_ context.Context, _ workflowdef.PersistLineItemInput) (*workflowdef.PersistLineItemResult, error) {
+			return &workflowdef.PersistLineItemResult{}, nil
+		},
+		activity.RegisterOptions{Name: workflowdef.PersistLineItemActivityName},
+	)
+
 	env.RegisterDelayedCallback(func() {
 		env.SignalWorkflow(workflowdef.CloseSignalName, struct{}{})
 	}, time.Second)
@@ -63,6 +70,13 @@ func TestBillingWorkflow_ClosesOnTimer(t *testing.T) {
 		invoiceCalls++
 		return nil
 	}, activity.RegisterOptions{Name: workflowdef.SendInvoiceActivityName})
+	env.RegisterActivityWithOptions(
+		func(_ context.Context, _ workflowdef.PersistLineItemInput) (*workflowdef.PersistLineItemResult, error) {
+			return &workflowdef.PersistLineItemResult{}, nil
+		},
+		activity.RegisterOptions{Name: workflowdef.PersistLineItemActivityName},
+	)
+
 	env.ExecuteWorkflow(workflowdef.BillingWorkflow, workflowdef.BillingWorkflowInput{
 		BillID:    billID,
 		PeriodEnd: time.Now().Add(time.Second),

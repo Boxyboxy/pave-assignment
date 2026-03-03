@@ -1,0 +1,15 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    queries: "internal/workerdb/query.sql"
+    schema: "billing/migrations/"
+    gen:
+      go:
+        package: "workerdb"
+        out: "internal/workerdb"
+        sql_package: "database/sql"
+        emit_json_tags: true
+        emit_exact_table_names: false
+        overrides:
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"

@@ -10,7 +10,7 @@ All amounts are represented in integer minor units:
 
 ## 1) Create bill
 
-`POST /bill`
+`POST /bills`
 
 ### Request body
 
@@ -61,7 +61,7 @@ All amounts are represented in integer minor units:
 
 ## 2) Add line item
 
-`POST /bill/:billID/item`
+`POST /bills/:billID/items`
 
 `idempotency_key` is required for this endpoint.
 
@@ -124,7 +124,7 @@ All amounts are represented in integer minor units:
 
 ## 3) Get bill details
 
-`GET /bill/:billID`
+`GET /bills/:billID`
 
 ### Response (200)
 
@@ -162,7 +162,15 @@ All amounts are represented in integer minor units:
 
 ## 4) Close bill
 
-`POST /bill/:billID/close`
+`PATCH /bills/:billID`
+
+### Request body
+
+```json
+{
+  "status": "CLOSED"
+}
+```
 
 ### Response (200)
 
@@ -172,12 +180,13 @@ Same shape as `GET /bill/:billID`, but `bill.status` is `CLOSED` and `bill.close
 - Endpoint is idempotent: repeated close calls return current closed state.
 - Close uses a transactional row lock (`SELECT ... FOR UPDATE`) so it serializes cleanly with concurrent `addLineItem` calls on the same bill.
 - Manual close also signals the Temporal workflow so it can terminate early. If the signal fails, a fallback workflow is started to ensure invoice delivery.
+- The service waits up to ~2 seconds for the underlying Temporal workflow to complete the close + invoice activities. If that wait times out or fails, the API returns an `unavailable`/`internal` style error so clients can treat the bill as “processing” and retry, instead of assuming it is fully closed.
 
 ---
 
 ## 5) List bills (paginated)
 
-`GET /bill`
+`GET /bills`
 
 ### Query parameters
 
@@ -258,22 +267,24 @@ Used operationally to backfill `workflow_run_id` for bills where workflow start 
 BASE_URL="http://127.0.0.1:4000"
 PERIOD_END="$(date -u -v+15M +%Y-%m-%dT%H:%M:%SZ)"
 
-CREATE_RESP="$(curl -sS -X POST "$BASE_URL/bill" \
+CREATE_RESP="$(curl -sS -X POST "$BASE_URL/bills" \
   -H "Content-Type: application/json" \
   -d "{\"account_id\":\"acct-demo\",\"currency\":\"USD\",\"period_end\":\"$PERIOD_END\"}")"
 
 echo "$CREATE_RESP"
 BILL_ID="$(echo "$CREATE_RESP" | jq -r '.id')"
 
-curl -sS -X POST "$BASE_URL/bill/$BILL_ID/item" \
+curl -sS -X POST "$BASE_URL/bills/$BILL_ID/items" \
   -H "Content-Type: application/json" \
   -d '{"description":"monthly fee","amount_minor":1299,"idempotency_key":"line-1"}'
 
-curl -sS -X POST "$BASE_URL/bill/$BILL_ID/item" \
+curl -sS -X POST "$BASE_URL/bills/$BILL_ID/items" \
   -H "Content-Type: application/json" \
   -d '{"description":"usage fee","amount_minor":501,"idempotency_key":"line-2"}'
 
-curl -sS "$BASE_URL/bill/$BILL_ID"
-curl -sS -X POST "$BASE_URL/bill/$BILL_ID/close"
-curl -sS "$BASE_URL/bill?status=CLOSED&account_id=acct-demo"
+curl -sS "$BASE_URL/bills/$BILL_ID"
+curl -sS -X PATCH "$BASE_URL/bills/$BILL_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"CLOSED"}'
+curl -sS "$BASE_URL/bills?status=CLOSED&account_id=acct-demo"
 ```

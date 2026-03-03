@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"encore.dev/beta/errs"
 	"github.com/google/uuid"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 )
 
 // ---------------------------------------------------------------------------
@@ -36,7 +38,7 @@ func initService() (*Service, error) {
 // Create bill
 // ---------------------------------------------------------------------------
 
-//encore:api public method=POST path=/bill
+//encore:api public method=POST path=/bills
 func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Bill, error) {
 	now := time.Now().UTC()
 	periodEnd, err := validateCreateBillRequest(req, now)
@@ -100,32 +102,37 @@ type CreateBillRequest struct {
 }
 
 // ---------------------------------------------------------------------------
-// Add line item
+// Add line item (write delegated to Temporal workflow via Update)
 // ---------------------------------------------------------------------------
 
-//encore:api public method=POST path=/bill/:billID/item
+//encore:api public method=POST path=/bills/:billID/items
 func (s *Service) AddLineItem(ctx context.Context, billID string, req *AddLineItemRequest) (*AddLineItemResponse, error) {
 	id, payloadHash, err := validateAddLineItemRequest(billID, req)
 	if err != nil {
 		return nil, errs.B().Code(errs.InvalidArgument).Msg(err.Error()).Err()
 	}
-	res, err := addLineItem(ctx, addLineItemParams{
-		BillID:         id,
+
+	workflowID := "bill-" + id.String()
+	result, err := s.updateLineItemWorkflow(ctx, workflowID, workflowdef.AddLineItemUpdateInput{
 		Description:    req.Description,
-		AmountMinor:    req.AmountMinor,
+		AmountMinor:    int64(req.AmountMinor),
 		IdempotencyKey: req.IdempotencyKey,
 		PayloadHash:    payloadHash,
 	})
 	if err != nil {
-		return nil, err
+		return nil, mapTemporalError(err)
 	}
-	return &AddLineItemResponse{Bill: res.Bill, Item: res.Item}, nil
+
+	return &AddLineItemResponse{
+		Bill: wfBillToBill(result.Bill),
+		Item: wfLineItemToLineItem(result.Item),
+	}, nil
 }
 
 type AddLineItemRequest struct {
-	Description    string `json:"description"`
-	AmountMinor    int64  `json:"amount_minor"`
-	IdempotencyKey string `json:"idempotency_key"`
+	Description    string    `json:"description"`
+	AmountMinor    MinorUnit `json:"amount_minor"`
+	IdempotencyKey string    `json:"idempotency_key"`
 }
 
 type AddLineItemResponse struct {
@@ -134,57 +141,75 @@ type AddLineItemResponse struct {
 }
 
 // ---------------------------------------------------------------------------
-// Close bill
+// Close bill (write delegated to Temporal workflow via Signal)
 // ---------------------------------------------------------------------------
 
-//encore:api public method=POST path=/bill/:billID/close
-func (s *Service) CloseBill(ctx context.Context, billID string) (*BillWithItems, error) {
+type UpdateBillRequest struct {
+	Status string `json:"status"`
+}
+
+//encore:api public method=PATCH path=/bills/:billID
+func (s *Service) UpdateBill(ctx context.Context, billID string, req *UpdateBillRequest) (*BillWithItems, error) {
 	id, err := parseBillID(billID)
 	if err != nil {
 		return nil, errs.B().Code(errs.InvalidArgument).Msg(err.Error()).Err()
 	}
 
-	// Attempt to signal the existing workflow for a clean close.
-	// If the signal succeeds, the workflow will close the bill and send the invoice.
-	signalSent := false
-	if workflowID, wfErr := getBillWorkflowID(ctx, id); wfErr == nil {
-		if sigErr := s.signalCloseBillingWorkflow(ctx, workflowID); sigErr != nil {
-			log.Printf(
-				"WARNING: failed to signal workflow close bill_id=%s workflow_id=%s err=%v",
-				billID, workflowID, sigErr,
-			)
+	if req == nil {
+		return nil, errs.B().Code(errs.InvalidArgument).Msg("missing request body").Err()
+	}
+	if strings.ToUpper(strings.TrimSpace(req.Status)) != string(BillStatusClosed) {
+		return nil, errs.B().Code(errs.InvalidArgument).Msg("only status=CLOSED is supported").Err()
+	}
+
+	workflowID := "bill-" + id.String()
+
+	// Signal the running workflow to close. The workflow loop will break,
+	// execute MarkClosedInDB + SendInvoice activities, then complete.
+	signalErr := s.signalCloseBillingWorkflow(ctx, workflowID)
+	if signalErr == nil {
+		// Signal accepted — wait for workflow to finish (close + invoice),
+		// but enforce a short upper bound on how long we block the caller.
+		if err := s.waitForWorkflowWithTimeout(ctx, workflowID, 2*time.Second); err != nil {
+			return nil, err
+		}
+	} else {
+		log.Printf("WARNING: signal close failed bill_id=%s err=%v (checking DB state)", billID, signalErr)
+
+		// Workflow may have already completed (timer auto-close). Check DB.
+		b, err := getBill(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if string(b.Status) == string(BillStatusOpen) {
+			// Bill is still OPEN but workflow is unreachable — start a
+			// fallback workflow with period_end = now so it closes immediately
+			// via the MarkClosedInDB activity. Deterministic workflow ID
+			// makes this idempotent across retries.
+			fallbackID := "bill-close-fallback-" + id.String()
+			if _, fbErr := s.startBillingWorkflow(ctx, fallbackID, workflowdef.BillingWorkflowInput{
+				BillID:    id.String(),
+				PeriodEnd: time.Now().UTC(),
+			}); fbErr != nil {
+				log.Printf("WARNING: fallback workflow start failed bill_id=%s err=%v", billID, fbErr)
+				return nil, errs.B().Code(errs.Unavailable).
+					Msg("unable to close bill: workflow service unavailable").Err()
+			}
+			if err := s.waitForWorkflowWithTimeout(ctx, fallbackID, 2*time.Second); err != nil {
+				return nil, err
+			}
 		} else {
-			signalSent = true
+			// Already CLOSED or CANCELLED, fall through to DB read below.
 		}
 	}
 
-	// Close bill in DB (transactional with row lock for serialization).
-	b, err := closeBill(ctx, id)
+	// Pure DB read for the response. At this point we either:
+	// - Observed the workflow complete within our wait window, or
+	// - Determined the bill was already CLOSED/CANCELLED.
+	b, err := getBill(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-
-	// If the workflow signal failed (workflow already completed / terminated /
-	// unreachable), start a fallback workflow to guarantee invoice delivery.
-	// The fallback has period_end = now so it fires immediately:
-	//   1. MarkClosedInDB → no-op (bill already closed)
-	//   2. SendInvoiceEmail → delivers the invoice
-	// Using a deterministic workflow ID ("bill-close-fallback-<id>") makes
-	// this idempotent: Temporal rejects duplicate IDs, so retrying the API
-	// call won't start multiple fallback workflows.
-	if !signalSent {
-		fallbackID := "bill-close-fallback-" + id.String()
-		if _, fbErr := s.startBillingWorkflow(ctx, fallbackID, workflowdef.BillingWorkflowInput{
-			BillID:    id.String(),
-			PeriodEnd: time.Now().UTC(),
-		}); fbErr != nil {
-			log.Printf(
-				"WARNING: failed to start fallback invoice workflow bill_id=%s fallback_workflow_id=%s err=%v",
-				billID, fallbackID, fbErr,
-			)
-		}
-	}
-
 	items, err := listLineItems(ctx, id)
 	if err != nil {
 		return nil, err
@@ -199,7 +224,7 @@ func (s *Service) CloseBill(ctx context.Context, billID string) (*BillWithItems,
 // Get bill
 // ---------------------------------------------------------------------------
 
-//encore:api public method=GET path=/bill/:billID
+//encore:api public method=GET path=/bills/:billID
 func (s *Service) GetBill(ctx context.Context, billID string) (*BillWithItems, error) {
 	id, err := parseBillID(billID)
 	if err != nil {
@@ -223,7 +248,7 @@ func (s *Service) GetBill(ctx context.Context, billID string) (*BillWithItems, e
 // List bills (paginated)
 // ---------------------------------------------------------------------------
 
-//encore:api public method=GET path=/bill
+//encore:api public method=GET path=/bills
 func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBillsResponse, error) {
 	var status *string
 	var accountID string
@@ -392,7 +417,7 @@ func validateAddLineItemRequest(billID string, req *AddLineItemRequest) (uuid.UU
 	if len(req.IdempotencyKey) > 200 {
 		return uuid.Nil, "", fmt.Errorf("idempotency_key too long")
 	}
-	return id, computeLineItemPayloadHash(req.Description, req.AmountMinor), nil
+	return id, computeLineItemPayloadHash(req.Description, int64(req.AmountMinor)), nil
 }
 
 func computeLineItemPayloadHash(description string, amountMinor int64) string {
@@ -420,4 +445,63 @@ func parseBillID(billID string) (uuid.UUID, error) {
 		return uuid.Nil, fmt.Errorf("invalid bill_id")
 	}
 	return id, nil
+}
+
+// ---------------------------------------------------------------------------
+// Temporal error mapping
+// ---------------------------------------------------------------------------
+
+// mapTemporalError converts Temporal-domain errors into Encore API errors
+// with the appropriate gRPC status code.
+func mapTemporalError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var appErr *temporal.ApplicationError
+	if errors.As(err, &appErr) {
+		switch appErr.Type() {
+		case "FAILED_PRECONDITION":
+			return errs.B().Code(errs.FailedPrecondition).Msg(appErr.Message()).Err()
+		case "ALREADY_EXISTS":
+			return errs.B().Code(errs.AlreadyExists).Msg(appErr.Message()).Err()
+		case "NOT_FOUND":
+			return errs.B().Code(errs.NotFound).Msg(appErr.Message()).Err()
+		}
+	}
+	// For unexpected errors, propagate a trimmed version of the original
+	// message so callers have some context without leaking excessive detail.
+	return errs.B().
+		Code(errs.Internal).
+		Msg(fmt.Sprintf("add line item failed: %v", err)).
+		Err()
+}
+
+// ---------------------------------------------------------------------------
+// Workflow ↔ API type conversion
+// ---------------------------------------------------------------------------
+
+func wfBillToBill(b workflowdef.WfBill) Bill {
+	return Bill{
+		ID:          b.ID,
+		AccountID:   b.AccountID,
+		Currency:    Currency(b.Currency),
+		Status:      BillStatus(b.Status),
+		CreatedAt:   b.CreatedAt,
+		UpdatedAt:   b.UpdatedAt,
+		PeriodStart: b.PeriodStart,
+		PeriodEnd:   b.PeriodEnd,
+		ClosedAt:    b.ClosedAt,
+		TotalMinor:  MinorUnit(b.TotalMinor),
+	}
+}
+
+func wfLineItemToLineItem(li workflowdef.WfLineItem) LineItem {
+	return LineItem{
+		ID:             li.ID,
+		BillID:         li.BillID,
+		IdempotencyKey: li.IdempotencyKey,
+		Description:    li.Description,
+		AmountMinor:    MinorUnit(li.AmountMinor),
+		CreatedAt:      li.CreatedAt,
+	}
 }

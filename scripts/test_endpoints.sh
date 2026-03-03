@@ -23,7 +23,7 @@ PY
 )"
 
 echo "1) Create bill"
-CREATE_RESP="$(curl -sS -X POST "$BASE_URL/bill" \
+CREATE_RESP="$(curl -sS -X POST "$BASE_URL/bills" \
   -H "Content-Type: application/json" \
   -d "{\"account_id\":\"acct-test-1\",\"currency\":\"USD\",\"period_end\":\"$SHORT_END\"}")"
 echo "$CREATE_RESP" | jq .
@@ -42,7 +42,7 @@ if [[ -z "$UPDATED_AT" || "$UPDATED_AT" == "null" ]]; then
 fi
 
 echo "2) Add line item"
-ADD_RESP="$(curl -sS -X POST "$BASE_URL/bill/$BILL_ID/item" \
+ADD_RESP="$(curl -sS -X POST "$BASE_URL/bills/$BILL_ID/items" \
   -H "Content-Type: application/json" \
   -d '{"description":"quick fee","amount_minor":123,"idempotency_key":"quick-1"}')"
 echo "$ADD_RESP" | jq .
@@ -61,7 +61,7 @@ if [[ -z "$UPDATED_AFTER_ADD" || "$UPDATED_AFTER_ADD" == "null" ]]; then
 fi
 
 echo "3) Idempotency check (same key should not increase total)"
-ADD_DUP_RESP="$(curl -sS -X POST "$BASE_URL/bill/$BILL_ID/item" \
+ADD_DUP_RESP="$(curl -sS -X POST "$BASE_URL/bills/$BILL_ID/items" \
   -H "Content-Type: application/json" \
   -d '{"description":"quick fee","amount_minor":123,"idempotency_key":"quick-1"}')"
 echo "$ADD_DUP_RESP" | jq .
@@ -73,7 +73,7 @@ fi
 
 echo "4) Payload mismatch check (same key + different payload should fail)"
 MISMATCH_HTTP_CODE="$(curl -sS -o /tmp/billing_idem_mismatch_resp.json -w "%{http_code}" \
-  -X POST "$BASE_URL/bill/$BILL_ID/item" \
+  -X POST "$BASE_URL/bills/$BILL_ID/items" \
   -H "Content-Type: application/json" \
   -d '{"description":"quick fee changed","amount_minor":999,"idempotency_key":"quick-1"}')"
 cat /tmp/billing_idem_mismatch_resp.json | jq .
@@ -84,7 +84,7 @@ fi
 
 echo "5) Missing idempotency key should fail"
 MISSING_IDEM_HTTP_CODE="$(curl -sS -o /tmp/billing_missing_idem_resp.json -w "%{http_code}" \
-  -X POST "$BASE_URL/bill/$BILL_ID/item" \
+  -X POST "$BASE_URL/bills/$BILL_ID/items" \
   -H "Content-Type: application/json" \
   -d '{"description":"missing key","amount_minor":50}')"
 cat /tmp/billing_missing_idem_resp.json | jq .
@@ -96,7 +96,7 @@ fi
 echo "6) Poll until auto-closed by workflow (up to 30s)"
 STATUS=""
 for _ in {1..15}; do
-  BILL_RESP="$(curl -sS "$BASE_URL/bill/$BILL_ID")"
+  BILL_RESP="$(curl -sS "$BASE_URL/bills/$BILL_ID")"
   STATUS="$(echo "$BILL_RESP" | jq -r '.bill.status')"
   echo "status=${STATUS}"
   if [[ "$STATUS" == "CLOSED" ]]; then
@@ -119,7 +119,7 @@ fi
 
 echo "7) Verify adding item to closed bill is rejected"
 HTTP_CODE="$(curl -sS -o /tmp/billing_closed_add_resp.json -w "%{http_code}" \
-  -X POST "$BASE_URL/bill/$BILL_ID/item" \
+  -X POST "$BASE_URL/bills/$BILL_ID/items" \
   -H "Content-Type: application/json" \
   -d '{"description":"late fee","amount_minor":100,"idempotency_key":"late-1"}')"
 cat /tmp/billing_closed_add_resp.json | jq .
@@ -134,17 +134,19 @@ from datetime import datetime, timezone, timedelta
 print((datetime.now(timezone.utc)+timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))
 PY
 )"
-MANUAL_CREATE="$(curl -sS -X POST "$BASE_URL/bill" \
+MANUAL_CREATE="$(curl -sS -X POST "$BASE_URL/bills" \
   -H "Content-Type: application/json" \
   -d "{\"account_id\":\"acct-test-1\",\"currency\":\"GEL\",\"period_end\":\"$MANUAL_END\"}")"
 echo "$MANUAL_CREATE" | jq .
 MANUAL_ID="$(echo "$MANUAL_CREATE" | jq -r '.id')"
 
-curl -sS -X POST "$BASE_URL/bill/$MANUAL_ID/item" \
+curl -sS -X POST "$BASE_URL/bills/$MANUAL_ID/items" \
   -H "Content-Type: application/json" \
   -d '{"description":"gel fee","amount_minor":500,"idempotency_key":"gel-1"}' | jq .
 
-CLOSE_RESP="$(curl -sS -X POST "$BASE_URL/bill/$MANUAL_ID/close")"
+CLOSE_RESP="$(curl -sS -X PATCH "$BASE_URL/bills/$MANUAL_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"CLOSED"}')"
 echo "$CLOSE_RESP" | jq .
 CLOSE_STATUS="$(echo "$CLOSE_RESP" | jq -r '.bill.status')"
 if [[ "$CLOSE_STATUS" != "CLOSED" ]]; then
@@ -158,7 +160,7 @@ if [[ -z "$CLOSE_UPDATED" || "$CLOSE_UPDATED" == "null" ]]; then
 fi
 
 echo "9) List closed bills with pagination and ensure both bills are present"
-LIST_RESP="$(curl -sS "$BASE_URL/bill?status=CLOSED&account_id=acct-test-1&limit=10&offset=0")"
+LIST_RESP="$(curl -sS "$BASE_URL/bills?status=CLOSED&account_id=acct-test-1&limit=10&offset=0")"
 echo "$LIST_RESP" | jq .
 MATCHED="$(echo "$LIST_RESP" | jq -r --arg id "$BILL_ID" '.bills[]? | select(.id == $id) | .id' | head -n1)"
 if [[ "$MATCHED" != "$BILL_ID" ]]; then

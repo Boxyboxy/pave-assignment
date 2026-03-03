@@ -14,7 +14,6 @@ CREATE TABLE bills (
 );
 
 CREATE INDEX bills_status_idx ON bills(status);
-CREATE INDEX bills_account_id_idx ON bills(account_id);
 CREATE INDEX bills_account_id_status_idx ON bills(account_id, status);
 CREATE INDEX bills_period_end_idx ON bills(period_end);
 CREATE INDEX bills_workflow_run_id_null_idx ON bills(created_at) WHERE workflow_run_id IS NULL;

@@ -2,9 +2,11 @@ package billing
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"pave-assignment/billing/workflowdef"
 
@@ -91,6 +93,58 @@ func (s *Service) terminateBillingWorkflow(ctx context.Context, workflowID, runI
 	}
 	if err := c.TerminateWorkflow(ctx, workflowID, runID, reason); err != nil {
 		return errs.Wrap(err, "terminate billing workflow")
+	}
+	return nil
+}
+
+func (s *Service) updateLineItemWorkflow(ctx context.Context, workflowID string, input workflowdef.AddLineItemUpdateInput) (*workflowdef.PersistLineItemResult, error) {
+	c, err := s.getTemporalClient()
+	if err != nil {
+		return nil, err
+	}
+	handle, err := c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
+		WorkflowID:   workflowID,
+		UpdateName:   workflowdef.AddLineItemUpdateName,
+		Args:         []interface{}{input},
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result workflowdef.PersistLineItemResult
+	if err := handle.Get(ctx, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (s *Service) waitForWorkflow(ctx context.Context, workflowID string) error {
+	c, err := s.getTemporalClient()
+	if err != nil {
+		return err
+	}
+	return c.GetWorkflow(ctx, workflowID, "").Get(ctx, nil)
+}
+
+// waitForWorkflowWithTimeout waits for the given workflow to complete, but
+// enforces an upper bound on how long the caller is blocked. If the timeout
+// elapses before completion, an Unavailable error is returned so callers can
+// retry or treat the bill as "processing" instead of assuming it is closed.
+func (s *Service) waitForWorkflowWithTimeout(parentCtx context.Context, workflowID string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
+	defer cancel()
+
+	if err := s.waitForWorkflow(ctx, workflowID); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return errs.B().
+				Code(errs.Unavailable).
+				Msg("bill close is still processing; please retry shortly").
+				Err()
+		}
+		return errs.B().
+			Code(errs.Internal).
+			Msg(fmt.Sprintf("waiting for bill close workflow failed: %v", err)).
+			Err()
 	}
 	return nil
 }
