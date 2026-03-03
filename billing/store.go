@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 )
 
+// billingDB is the Encore-managed database handle for the billing service.
 var billingDB = sqldb.NewDatabase("billing", sqldb.DatabaseConfig{
 	Migrations: "./migrations",
 })
@@ -66,6 +67,7 @@ func scanBill(row interface{ Scan(dest ...any) error }) (*Bill, error) {
 // Create bill
 // ---------------------------------------------------------------------------
 
+// createBillParams groups the inputs for inserting a new bill row.
 type createBillParams struct {
 	ID          uuid.UUID
 	AccountID   string
@@ -75,6 +77,7 @@ type createBillParams struct {
 	WorkflowID  string
 }
 
+// createBill inserts a new OPEN bill and returns it with DB-generated timestamps.
 func createBill(ctx context.Context, p createBillParams) (*Bill, error) {
 	var createdAt, updatedAt time.Time
 	err := billingDB.QueryRow(ctx, `
@@ -102,6 +105,7 @@ func createBill(ctx context.Context, p createBillParams) (*Bill, error) {
 // Bill workflow helpers
 // ---------------------------------------------------------------------------
 
+// setBillWorkflowRunID persists the Temporal run ID for a bill.
 func setBillWorkflowRunID(ctx context.Context, billID uuid.UUID, runID string) error {
 	_, err := billingDB.Exec(ctx, `
 		UPDATE bills SET workflow_run_id = $2, updated_at = NOW()
@@ -113,6 +117,7 @@ func setBillWorkflowRunID(ctx context.Context, billID uuid.UUID, runID string) e
 	return nil
 }
 
+// cancelBill transitions an OPEN bill to CANCELLED. No-ops are logged as warnings.
 func cancelBill(ctx context.Context, billID uuid.UUID) error {
 	result, err := billingDB.Exec(ctx, `
 		UPDATE bills SET status = 'CANCELLED', closed_at = NOW(), updated_at = NOW()
@@ -136,6 +141,7 @@ func cancelBill(ctx context.Context, billID uuid.UUID) error {
 // Get bill
 // ---------------------------------------------------------------------------
 
+// getBill loads a single bill by ID, returning NotFound if it does not exist.
 func getBill(ctx context.Context, billID uuid.UUID) (*Bill, error) {
 	row := billingDB.QueryRow(ctx, `
 		SELECT `+billColumns+` FROM bills WHERE id = $1
@@ -154,11 +160,13 @@ func getBill(ctx context.Context, billID uuid.UUID) (*Bill, error) {
 // List bills (paginated)
 // ---------------------------------------------------------------------------
 
+// billWorkflowRef pairs a bill ID with its Temporal workflow ID.
 type billWorkflowRef struct {
 	BillID     uuid.UUID
 	WorkflowID string
 }
 
+// listBillsParams groups filter and pagination inputs for listing bills.
 type listBillsParams struct {
 	Status    *BillStatus
 	AccountID string
@@ -166,6 +174,7 @@ type listBillsParams struct {
 	Offset    int
 }
 
+// listBills returns a filtered, paginated slice of bills and the total count.
 func listBills(ctx context.Context, p listBillsParams) ([]Bill, int, error) {
 	// Build WHERE clause dynamically with parameterised values.
 	// NOTE: hand-rolled arg-index tracking; consider squirrel or sqlc if filter count grows.
@@ -222,6 +231,7 @@ func listBills(ctx context.Context, p listBillsParams) ([]Bill, int, error) {
 	return bills, total, nil
 }
 
+// listBillsMissingWorkflowRunID returns bills that still need their run ID back-filled.
 func listBillsMissingWorkflowRunID(ctx context.Context, limit int) ([]billWorkflowRef, error) {
 	rows, err := billingDB.Query(ctx, `
 		SELECT id, workflow_id
@@ -250,9 +260,31 @@ func listBillsMissingWorkflowRunID(ctx context.Context, limit int) ([]billWorkfl
 }
 
 // ---------------------------------------------------------------------------
+// Composite reads
+// ---------------------------------------------------------------------------
+
+// loadBillWithItems fetches a bill and its line items from the database,
+// returning a combined response. Used by GetBill and UpdateBill handlers.
+func loadBillWithItems(ctx context.Context, id uuid.UUID) (*BillWithItems, error) {
+	b, err := getBill(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	items, err := listLineItems(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if items == nil {
+		items = []LineItem{}
+	}
+	return &BillWithItems{Bill: *b, Items: items}, nil
+}
+
+// ---------------------------------------------------------------------------
 // Line items
 // ---------------------------------------------------------------------------
 
+// listLineItems returns all line items for a bill ordered by creation time.
 func listLineItems(ctx context.Context, billID uuid.UUID) ([]LineItem, error) {
 	rows, err := billingDB.Query(ctx, `
 		SELECT id, bill_id, idempotency_key, description, amount_minor, created_at

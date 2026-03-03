@@ -10,23 +10,27 @@ A billing service that accrues fees progressively during a billing period. All w
 ├── billing/
 │   ├── migrations/
 │   │   └── 1_init_schema.up.sql
-│   ├── api.go              # HTTP handlers (writes via Temporal, reads via DB)
+│   ├── handlers.go          # HTTP handlers + request/response types
+│   ├── validation.go        # Request validation, parsing, payload hashing
+│   ├── converters.go        # Workflow ↔ API type conversion + Temporal error mapping
+│   ├── temporal_client.go   # Service definition + Temporal client (start, update, signal, wait)
 │   ├── store.go             # Database reads + bill creation
-│   ├── workflow.go          # Temporal client helpers (start, update, signal, wait)
 │   ├── types.go             # Domain types (Bill, LineItem, Currency)
 │   ├── api_validation_test.go
 │   ├── workflow_test.go
 │   └── workflowdef/
 │       ├── workflow.go      # Temporal workflow (Update handler, Signal, timer)
 │       ├── activities.go    # Temporal activities (PersistLineItem, MarkClosed, SendInvoice)
-│       └── closebill.go     # Sentinel errors (ErrBillNotFound, ErrBillNotOpen, etc.)
+│       └── types.go         # Shared types, payloads, sentinel errors
 ├── internal/workerdb/
 │   ├── query.sql            # sqlc query definitions (source of truth)
 │   ├── db.go                # sqlc generated: DBTX interface, Queries struct
 │   ├── models.go            # sqlc generated: table models
 │   └── query.sql.go         # sqlc generated: query functions
 ├── cmd/fees-worker/
-│   ├── main.go              # Temporal worker (uses sqlc queries, connects to DB)
+│   ├── main.go              # Worker bootstrap + wiring
+│   ├── close_bill.go        # CloseBill activity implementation
+│   ├── persist_line_item.go # PersistLineItem activity + invoice stub
 │   └── main_test.go
 ├── sqlc.yaml                # sqlc configuration
 ├── scripts/

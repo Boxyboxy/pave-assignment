@@ -7,6 +7,7 @@ import (
 	"go.temporal.io/sdk/workflow"
 )
 
+// Temporal registration names and defaults for the billing workflow.
 const (
 	BillingTaskQueue = "billing-workflow"
 	WorkflowName     = "billing-workflow-v1"
@@ -19,67 +20,9 @@ const (
 	SendInvoiceActivityName     = "billing.send-invoice-email"
 	PersistLineItemActivityName = "billing.persist-line-item"
 
+	// defaultTTL is the maximum bill lifetime when no period_end is specified.
 	defaultTTL = 30 * 24 * time.Hour
 )
-
-// ---------------------------------------------------------------------------
-// Types exchanged through Temporal (must be JSON-serialisable)
-// ---------------------------------------------------------------------------
-
-// BillingWorkflowInput is the initial input when starting a billing workflow.
-type BillingWorkflowInput struct {
-	BillID    string    `json:"bill_id"`
-	PeriodEnd time.Time `json:"period_end"`
-}
-
-// AddLineItemUpdateInput is the payload sent to the running workflow via Update.
-type AddLineItemUpdateInput struct {
-	Description    string `json:"description"`
-	AmountMinor    int64  `json:"amount_minor"`
-	IdempotencyKey string `json:"idempotency_key"`
-	PayloadHash    string `json:"payload_hash"`
-}
-
-// PersistLineItemInput is the payload sent to the PersistLineItem activity.
-type PersistLineItemInput struct {
-	BillID         string `json:"bill_id"`
-	Description    string `json:"description"`
-	AmountMinor    int64  `json:"amount_minor"`
-	IdempotencyKey string `json:"idempotency_key"`
-	PayloadHash    string `json:"payload_hash"`
-}
-
-// PersistLineItemResult is returned by the PersistLineItem activity and
-// propagated back through the Update to the API caller.
-type PersistLineItemResult struct {
-	Inserted bool       `json:"inserted"`
-	Item     WfLineItem `json:"item"`
-	Bill     WfBill     `json:"bill"`
-}
-
-// WfLineItem is the Temporal-serialisable representation of a line item.
-type WfLineItem struct {
-	ID             string    `json:"id"`
-	BillID         string    `json:"bill_id"`
-	IdempotencyKey string    `json:"idempotency_key,omitempty"`
-	Description    string    `json:"description"`
-	AmountMinor    int64     `json:"amount_minor"`
-	CreatedAt      time.Time `json:"created_at"`
-}
-
-// WfBill is the Temporal-serialisable representation of a bill.
-type WfBill struct {
-	ID          string     `json:"id"`
-	AccountID   string     `json:"account_id"`
-	Currency    string     `json:"currency"`
-	Status      string     `json:"status"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
-	PeriodStart time.Time  `json:"period_start"`
-	PeriodEnd   time.Time  `json:"period_end"`
-	ClosedAt    *time.Time `json:"closed_at,omitempty"`
-	TotalMinor  int64      `json:"total_minor"`
-}
 
 // ---------------------------------------------------------------------------
 // Workflow

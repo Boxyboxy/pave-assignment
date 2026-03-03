@@ -2,42 +2,31 @@ package billing
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"errors"
 	"fmt"
 	"log"
 	"strings"
-	"sync"
 	"time"
 
 	"pave-assignment/billing/workflowdef"
 
 	"encore.dev/beta/errs"
 	"github.com/google/uuid"
-	"go.temporal.io/sdk/client"
-	"go.temporal.io/sdk/temporal"
 )
-
-// ---------------------------------------------------------------------------
-// Service definition
-// ---------------------------------------------------------------------------
-
-//encore:service
-type Service struct {
-	// tc is the lazily-initialised Temporal client. Access via getTemporalClient().
-	tc   client.Client
-	tcMu sync.Mutex
-}
-
-func initService() (*Service, error) {
-	return &Service{}, nil
-}
 
 // ---------------------------------------------------------------------------
 // Create bill
 // ---------------------------------------------------------------------------
 
+// CreateBillRequest is the payload for creating a new bill.
+type CreateBillRequest struct {
+	AccountID string    `json:"account_id"`
+	Currency  Currency  `json:"currency"`
+	PeriodEnd time.Time `json:"period_end"`
+}
+
+// CreateBill creates a new bill, inserts it into the DB, and starts the
+// corresponding Temporal billing workflow.
+//
 //encore:api public method=POST path=/bills
 func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Bill, error) {
 	now := time.Now().UTC()
@@ -47,7 +36,7 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Bill
 	}
 
 	billID := uuid.New()
-	workflowID := "bill-" + billID.String()
+	workflowID := billingWorkflowID(billID)
 
 	bill, err := createBill(ctx, createBillParams{
 		ID:          billID,
@@ -95,16 +84,26 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Bill
 	return bill, nil
 }
 
-type CreateBillRequest struct {
-	AccountID string    `json:"account_id"`
-	Currency  Currency  `json:"currency"`
-	PeriodEnd time.Time `json:"period_end"`
-}
-
 // ---------------------------------------------------------------------------
 // Add line item (write delegated to Temporal workflow via Update)
 // ---------------------------------------------------------------------------
 
+// AddLineItemRequest is the payload for adding a line item to an open bill.
+type AddLineItemRequest struct {
+	Description    string    `json:"description"`
+	AmountMinor    MinorUnit `json:"amount_minor"`
+	IdempotencyKey string    `json:"idempotency_key"`
+}
+
+// AddLineItemResponse contains the updated bill and the persisted line item.
+type AddLineItemResponse struct {
+	Bill Bill     `json:"bill"`
+	Item LineItem `json:"item"`
+}
+
+// AddLineItem delegates line-item creation to the Temporal workflow via Update,
+// ensuring durable persistence and idempotency.
+//
 //encore:api public method=POST path=/bills/:billID/items
 func (s *Service) AddLineItem(ctx context.Context, billID string, req *AddLineItemRequest) (*AddLineItemResponse, error) {
 	id, payloadHash, err := validateAddLineItemRequest(billID, req)
@@ -112,7 +111,7 @@ func (s *Service) AddLineItem(ctx context.Context, billID string, req *AddLineIt
 		return nil, errs.B().Code(errs.InvalidArgument).Msg(err.Error()).Err()
 	}
 
-	workflowID := "bill-" + id.String()
+	workflowID := billingWorkflowID(id)
 	result, err := s.updateLineItemWorkflow(ctx, workflowID, workflowdef.AddLineItemUpdateInput{
 		Description:    req.Description,
 		AmountMinor:    int64(req.AmountMinor),
@@ -129,25 +128,19 @@ func (s *Service) AddLineItem(ctx context.Context, billID string, req *AddLineIt
 	}, nil
 }
 
-type AddLineItemRequest struct {
-	Description    string    `json:"description"`
-	AmountMinor    MinorUnit `json:"amount_minor"`
-	IdempotencyKey string    `json:"idempotency_key"`
-}
-
-type AddLineItemResponse struct {
-	Bill Bill     `json:"bill"`
-	Item LineItem `json:"item"`
-}
-
 // ---------------------------------------------------------------------------
 // Close bill (write delegated to Temporal workflow via Signal)
 // ---------------------------------------------------------------------------
 
+// UpdateBillRequest is the payload for updating a bill (currently only closing).
 type UpdateBillRequest struct {
 	Status string `json:"status"`
 }
 
+// UpdateBill closes a bill by signalling its Temporal workflow. If the
+// workflow is already completed, a fallback workflow is started to close
+// the bill via the MarkClosedInDB activity.
+//
 //encore:api public method=PATCH path=/bills/:billID
 func (s *Service) UpdateBill(ctx context.Context, billID string, req *UpdateBillRequest) (*BillWithItems, error) {
 	id, err := parseBillID(billID)
@@ -162,7 +155,7 @@ func (s *Service) UpdateBill(ctx context.Context, billID string, req *UpdateBill
 		return nil, errs.B().Code(errs.InvalidArgument).Msg("only status=CLOSED is supported").Err()
 	}
 
-	workflowID := "bill-" + id.String()
+	workflowID := billingWorkflowID(id)
 
 	// Signal the running workflow to close. The workflow loop will break,
 	// execute MarkClosedInDB + SendInvoice activities, then complete.
@@ -170,7 +163,7 @@ func (s *Service) UpdateBill(ctx context.Context, billID string, req *UpdateBill
 	if signalErr == nil {
 		// Signal accepted — wait for workflow to finish (close + invoice),
 		// but enforce a short upper bound on how long we block the caller.
-		if err := s.waitForWorkflowWithTimeout(ctx, workflowID, 2*time.Second); err != nil {
+		if err := s.waitForWorkflowWithTimeout(ctx, workflowID, closeWaitTimeout); err != nil {
 			return nil, err
 		}
 	} else {
@@ -181,12 +174,12 @@ func (s *Service) UpdateBill(ctx context.Context, billID string, req *UpdateBill
 		if err != nil {
 			return nil, err
 		}
-		if string(b.Status) == string(BillStatusOpen) {
+		if b.Status == BillStatusOpen {
 			// Bill is still OPEN but workflow is unreachable — start a
 			// fallback workflow with period_end = now so it closes immediately
 			// via the MarkClosedInDB activity. Deterministic workflow ID
 			// makes this idempotent across retries.
-			fallbackID := "bill-close-fallback-" + id.String()
+			fallbackID := fallbackCloseWorkflowID(id)
 			if _, fbErr := s.startBillingWorkflow(ctx, fallbackID, workflowdef.BillingWorkflowInput{
 				BillID:    id.String(),
 				PeriodEnd: time.Now().UTC(),
@@ -195,59 +188,53 @@ func (s *Service) UpdateBill(ctx context.Context, billID string, req *UpdateBill
 				return nil, errs.B().Code(errs.Unavailable).
 					Msg("unable to close bill: workflow service unavailable").Err()
 			}
-			if err := s.waitForWorkflowWithTimeout(ctx, fallbackID, 2*time.Second); err != nil {
+			if err := s.waitForWorkflowWithTimeout(ctx, fallbackID, closeWaitTimeout); err != nil {
 				return nil, err
 			}
-		} else {
-			// Already CLOSED or CANCELLED, fall through to DB read below.
 		}
+		// Already CLOSED or CANCELLED — fall through to DB read below.
 	}
 
-	// Pure DB read for the response. At this point we either:
-	// - Observed the workflow complete within our wait window, or
-	// - Determined the bill was already CLOSED/CANCELLED.
-	b, err := getBill(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	items, err := listLineItems(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if items == nil {
-		items = []LineItem{}
-	}
-	return &BillWithItems{Bill: *b, Items: items}, nil
+	return loadBillWithItems(ctx, id)
 }
 
 // ---------------------------------------------------------------------------
 // Get bill
 // ---------------------------------------------------------------------------
 
+// GetBill returns a single bill with all its line items.
+//
 //encore:api public method=GET path=/bills/:billID
 func (s *Service) GetBill(ctx context.Context, billID string) (*BillWithItems, error) {
 	id, err := parseBillID(billID)
 	if err != nil {
 		return nil, errs.B().Code(errs.InvalidArgument).Msg(err.Error()).Err()
 	}
-	b, err := getBill(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	items, err := listLineItems(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if items == nil {
-		items = []LineItem{}
-	}
-	return &BillWithItems{Bill: *b, Items: items}, nil
+	return loadBillWithItems(ctx, id)
 }
 
 // ---------------------------------------------------------------------------
 // List bills (paginated)
 // ---------------------------------------------------------------------------
 
+// ListBillsRequest carries optional filters and pagination parameters.
+type ListBillsRequest struct {
+	Status    string `query:"status"`
+	AccountID string `query:"account_id"`
+	Limit     int    `query:"limit"`
+	Offset    int    `query:"offset"`
+}
+
+// ListBillsResponse wraps the paginated bill list with total count metadata.
+type ListBillsResponse struct {
+	Bills  []Bill `json:"bills"`
+	Total  int    `json:"total"`
+	Limit  int    `json:"limit"`
+	Offset int    `json:"offset"`
+}
+
+// ListBills returns a paginated list of bills with optional status/account filters.
+//
 //encore:api public method=GET path=/bills
 func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBillsResponse, error) {
 	var status *string
@@ -293,24 +280,26 @@ func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBi
 	}, nil
 }
 
-type ListBillsRequest struct {
-	Status    string `query:"status"`
-	AccountID string `query:"account_id"`
-	Limit     int    `query:"limit"`
-	Offset    int    `query:"offset"`
-}
-
-type ListBillsResponse struct {
-	Bills  []Bill `json:"bills"`
-	Total  int    `json:"total"`
-	Limit  int    `json:"limit"`
-	Offset int    `json:"offset"`
-}
-
 // ---------------------------------------------------------------------------
 // Reconcile workflow run IDs (private / operational)
 // ---------------------------------------------------------------------------
 
+// ReconcileWorkflowRunIDsRequest controls the batch size for reconciliation.
+type ReconcileWorkflowRunIDsRequest struct {
+	Limit int `json:"limit"`
+}
+
+// ReconcileWorkflowRunIDsResponse reports reconciliation results.
+type ReconcileWorkflowRunIDsResponse struct {
+	Scanned    int      `json:"scanned"`
+	Backfilled int      `json:"backfilled"`
+	Failed     int      `json:"failed"`
+	Errors     []string `json:"errors,omitempty"`
+}
+
+// ReconcileWorkflowRunIDs back-fills missing workflow_run_id values by
+// describing each workflow in Temporal. Private/operational endpoint.
+//
 //encore:api private method=POST path=/internal/workflows/reconcile-run-ids
 func (s *Service) ReconcileWorkflowRunIDs(ctx context.Context, req *ReconcileWorkflowRunIDsRequest) (*ReconcileWorkflowRunIDsResponse, error) {
 	limit := 100
@@ -351,157 +340,4 @@ func (s *Service) ReconcileWorkflowRunIDs(ctx context.Context, req *ReconcileWor
 	}
 	log.Printf("workflow run id reconciliation scanned=%d backfilled=%d failed=%d", res.Scanned, res.Backfilled, res.Failed)
 	return res, nil
-}
-
-type ReconcileWorkflowRunIDsRequest struct {
-	Limit int `json:"limit"`
-}
-
-type ReconcileWorkflowRunIDsResponse struct {
-	Scanned    int      `json:"scanned"`
-	Backfilled int      `json:"backfilled"`
-	Failed     int      `json:"failed"`
-	Errors     []string `json:"errors,omitempty"`
-}
-
-// ---------------------------------------------------------------------------
-// Validation helpers
-// ---------------------------------------------------------------------------
-
-func validateCreateBillRequest(req *CreateBillRequest, now time.Time) (time.Time, error) {
-	if req == nil {
-		return time.Time{}, fmt.Errorf("missing request body")
-	}
-	req.AccountID = strings.TrimSpace(req.AccountID)
-	if req.AccountID == "" {
-		return time.Time{}, fmt.Errorf("account_id is required")
-	}
-	if len(req.AccountID) > 200 {
-		return time.Time{}, fmt.Errorf("account_id too long")
-	}
-	if err := req.Currency.Validate(); err != nil {
-		return time.Time{}, err
-	}
-	periodEnd := req.PeriodEnd.UTC()
-	if periodEnd.IsZero() {
-		return time.Time{}, fmt.Errorf("period_end is required")
-	}
-	if !periodEnd.After(now) {
-		return time.Time{}, fmt.Errorf("period_end must be in the future")
-	}
-	if periodEnd.Sub(now) > 365*24*time.Hour {
-		return time.Time{}, fmt.Errorf("period_end too far in the future")
-	}
-	return periodEnd, nil
-}
-
-func validateAddLineItemRequest(billID string, req *AddLineItemRequest) (uuid.UUID, string, error) {
-	if req == nil {
-		return uuid.Nil, "", fmt.Errorf("missing request body")
-	}
-	id, err := parseBillID(billID)
-	if err != nil {
-		return uuid.Nil, "", err
-	}
-	req.Description = strings.TrimSpace(req.Description)
-	if req.Description == "" {
-		return uuid.Nil, "", fmt.Errorf("description is required")
-	}
-	if req.AmountMinor <= 0 {
-		return uuid.Nil, "", fmt.Errorf("amount_minor must be > 0")
-	}
-	req.IdempotencyKey = strings.TrimSpace(req.IdempotencyKey)
-	if req.IdempotencyKey == "" {
-		return uuid.Nil, "", fmt.Errorf("idempotency_key is required")
-	}
-	if len(req.IdempotencyKey) > 200 {
-		return uuid.Nil, "", fmt.Errorf("idempotency_key too long")
-	}
-	return id, computeLineItemPayloadHash(req.Description, int64(req.AmountMinor)), nil
-}
-
-func computeLineItemPayloadHash(description string, amountMinor int64) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d", description, amountMinor)))
-	return hex.EncodeToString(sum[:])
-}
-
-func parseBillStatusFilter(status *string) (*BillStatus, error) {
-	if status == nil {
-		return nil, nil
-	}
-	s := strings.ToUpper(strings.TrimSpace(*status))
-	tmp := BillStatus(s)
-	switch tmp {
-	case BillStatusOpen, BillStatusClosed, BillStatusCancelled:
-		return &tmp, nil
-	default:
-		return nil, fmt.Errorf("invalid status; expected OPEN, CLOSED, or CANCELLED")
-	}
-}
-
-func parseBillID(billID string) (uuid.UUID, error) {
-	id, err := uuid.Parse(billID)
-	if err != nil {
-		return uuid.Nil, fmt.Errorf("invalid bill_id")
-	}
-	return id, nil
-}
-
-// ---------------------------------------------------------------------------
-// Temporal error mapping
-// ---------------------------------------------------------------------------
-
-// mapTemporalError converts Temporal-domain errors into Encore API errors
-// with the appropriate gRPC status code.
-func mapTemporalError(err error) error {
-	if err == nil {
-		return nil
-	}
-	var appErr *temporal.ApplicationError
-	if errors.As(err, &appErr) {
-		switch appErr.Type() {
-		case "FAILED_PRECONDITION":
-			return errs.B().Code(errs.FailedPrecondition).Msg(appErr.Message()).Err()
-		case "ALREADY_EXISTS":
-			return errs.B().Code(errs.AlreadyExists).Msg(appErr.Message()).Err()
-		case "NOT_FOUND":
-			return errs.B().Code(errs.NotFound).Msg(appErr.Message()).Err()
-		}
-	}
-	// For unexpected errors, propagate a trimmed version of the original
-	// message so callers have some context without leaking excessive detail.
-	return errs.B().
-		Code(errs.Internal).
-		Msg(fmt.Sprintf("add line item failed: %v", err)).
-		Err()
-}
-
-// ---------------------------------------------------------------------------
-// Workflow ↔ API type conversion
-// ---------------------------------------------------------------------------
-
-func wfBillToBill(b workflowdef.WfBill) Bill {
-	return Bill{
-		ID:          b.ID,
-		AccountID:   b.AccountID,
-		Currency:    Currency(b.Currency),
-		Status:      BillStatus(b.Status),
-		CreatedAt:   b.CreatedAt,
-		UpdatedAt:   b.UpdatedAt,
-		PeriodStart: b.PeriodStart,
-		PeriodEnd:   b.PeriodEnd,
-		ClosedAt:    b.ClosedAt,
-		TotalMinor:  MinorUnit(b.TotalMinor),
-	}
-}
-
-func wfLineItemToLineItem(li workflowdef.WfLineItem) LineItem {
-	return LineItem{
-		ID:             li.ID,
-		BillID:         li.BillID,
-		IdempotencyKey: li.IdempotencyKey,
-		Description:    li.Description,
-		AmountMinor:    MinorUnit(li.AmountMinor),
-		CreatedAt:      li.CreatedAt,
-	}
 }

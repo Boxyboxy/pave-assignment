@@ -5,10 +5,10 @@ import (
 	"time"
 )
 
-// MinorUnit represents a monetary amount in the smallest denomination (for example, cents for USD or tetri for GEL).
+// MinorUnit represents a monetary amount in its smallest denomination (e.g. cents for USD, tetri for GEL).
 type MinorUnit int64
 
-// Currency represents the system of money used in a country. For this assignment, we are only considering USD and GEL.
+// Currency identifies a supported monetary currency (USD, GEL).
 type Currency string
 
 const (
@@ -16,6 +16,7 @@ const (
 	CurrencyGEL Currency = "GEL"
 )
 
+// Validate returns an error if c is not a supported currency.
 func (c Currency) Validate() error {
 	switch c {
 	case CurrencyUSD, CurrencyGEL:
@@ -25,6 +26,7 @@ func (c Currency) Validate() error {
 	}
 }
 
+// BillStatus represents the lifecycle state of a bill.
 type BillStatus string
 
 const (
@@ -33,6 +35,7 @@ const (
 	BillStatusCancelled BillStatus = "CANCELLED"
 )
 
+// Bill is the API-facing representation of a billing period.
 type Bill struct {
 	ID          string     `json:"id"`
 	AccountID   string     `json:"account_id"`
@@ -46,6 +49,7 @@ type Bill struct {
 	TotalMinor  MinorUnit  `json:"total_minor"`
 }
 
+// LineItem is a single charge within a bill.
 type LineItem struct {
 	ID             string    `json:"id"`
 	BillID         string    `json:"bill_id"`
@@ -55,6 +59,7 @@ type LineItem struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
+// BillWithItems bundles a bill with its line items for detail responses.
 type BillWithItems struct {
 	Bill  Bill       `json:"bill"`
 	Items []LineItem `json:"items"`

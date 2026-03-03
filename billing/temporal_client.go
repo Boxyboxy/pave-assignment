@@ -6,18 +6,61 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"pave-assignment/billing/workflowdef"
 
 	"encore.dev/beta/errs"
+	"github.com/google/uuid"
 	"go.temporal.io/sdk/client"
 )
+
+// ---------------------------------------------------------------------------
+// Service definition
+// ---------------------------------------------------------------------------
+
+// Service is the Encore billing service. It holds a lazily-initialised
+// Temporal client used by all workflow operations.
+//
+//encore:service
+type Service struct {
+	tc   client.Client // access via getTemporalClient()
+	tcMu sync.Mutex
+}
+
+// initService is the Encore service constructor; Temporal connection is deferred to first use.
+func initService() (*Service, error) {
+	return &Service{}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Workflow ID conventions
+// ---------------------------------------------------------------------------
+
+// billingWorkflowID returns the deterministic Temporal workflow ID for a bill.
+func billingWorkflowID(billID uuid.UUID) string {
+	return "bill-" + billID.String()
+}
+
+// fallbackCloseWorkflowID returns the deterministic Temporal workflow ID used
+// when the primary workflow is unreachable and a fallback close is needed.
+func fallbackCloseWorkflowID(billID uuid.UUID) string {
+	return "bill-close-fallback-" + billID.String()
+}
+
+// closeWaitTimeout is the maximum time the API will block waiting for a
+// close-bill workflow to finish before returning an "in progress" response.
+const closeWaitTimeout = 2 * time.Second
+
+// ---------------------------------------------------------------------------
+// Temporal client lifecycle
+// ---------------------------------------------------------------------------
 
 // dialTemporal creates a new Temporal client connection.
 //
 // The address is read from TEMPORAL_ADDRESS (required in non-dev environments).
-// If the variable is unset, we fall back to localhost:7233 which is the default
+// If the variable is unset, we fall back to 127.0.0.1:7233 which is the default
 // address used by `temporal server start-dev` for local development.
 func dialTemporal() (client.Client, error) {
 	namespace := os.Getenv("TEMPORAL_NAMESPACE")
@@ -60,6 +103,11 @@ func (s *Service) getTemporalClient() (client.Client, error) {
 	return s.tc, nil
 }
 
+// ---------------------------------------------------------------------------
+// Temporal workflow operations
+// ---------------------------------------------------------------------------
+
+// startBillingWorkflow starts a new BillingWorkflow and returns its run ID.
 func (s *Service) startBillingWorkflow(ctx context.Context, workflowID string, in workflowdef.BillingWorkflowInput) (string, error) {
 	c, err := s.getTemporalClient()
 	if err != nil {
@@ -75,6 +123,7 @@ func (s *Service) startBillingWorkflow(ctx context.Context, workflowID string, i
 	return run.GetRunID(), nil
 }
 
+// signalCloseBillingWorkflow sends the close signal to a running billing workflow.
 func (s *Service) signalCloseBillingWorkflow(ctx context.Context, workflowID string) error {
 	c, err := s.getTemporalClient()
 	if err != nil {
@@ -86,6 +135,7 @@ func (s *Service) signalCloseBillingWorkflow(ctx context.Context, workflowID str
 	return nil
 }
 
+// terminateBillingWorkflow forcefully terminates a workflow execution.
 func (s *Service) terminateBillingWorkflow(ctx context.Context, workflowID, runID, reason string) error {
 	c, err := s.getTemporalClient()
 	if err != nil {
@@ -97,6 +147,8 @@ func (s *Service) terminateBillingWorkflow(ctx context.Context, workflowID, runI
 	return nil
 }
 
+// updateLineItemWorkflow sends an add-line-item Update to the workflow and
+// blocks until the activity completes, returning the persisted result.
 func (s *Service) updateLineItemWorkflow(ctx context.Context, workflowID string, input workflowdef.AddLineItemUpdateInput) (*workflowdef.PersistLineItemResult, error) {
 	c, err := s.getTemporalClient()
 	if err != nil {
@@ -118,6 +170,7 @@ func (s *Service) updateLineItemWorkflow(ctx context.Context, workflowID string,
 	return &result, nil
 }
 
+// waitForWorkflow blocks until the given workflow run completes.
 func (s *Service) waitForWorkflow(ctx context.Context, workflowID string) error {
 	c, err := s.getTemporalClient()
 	if err != nil {
@@ -149,6 +202,7 @@ func (s *Service) waitForWorkflowWithTimeout(parentCtx context.Context, workflow
 	return nil
 }
 
+// describeBillingWorkflowRunID fetches the current run ID for a workflow via Describe.
 func (s *Service) describeBillingWorkflowRunID(ctx context.Context, workflowID string) (string, error) {
 	c, err := s.getTemporalClient()
 	if err != nil {
