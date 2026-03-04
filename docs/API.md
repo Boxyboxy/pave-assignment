@@ -22,7 +22,7 @@ All amounts are represented in integer minor units:
 }
 ```
 
-| Field        | Type   | Required | Notes                                          |
+| Field        | Type   | Required | Notes                                           |
 |--------------|--------|----------|-------------------------------------------------|
 | `account_id` | string | yes      | Identifies the account that owns this bill      |
 | `currency`   | string | yes      | `"USD"` or `"GEL"`                              |

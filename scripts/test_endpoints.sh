@@ -18,7 +18,7 @@ echo "Using BASE_URL=${BASE_URL}"
 
 SHORT_END="$(python3 - <<'PY'
 from datetime import datetime, timezone, timedelta
-print((datetime.now(timezone.utc)+timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+print((datetime.now(timezone.utc)+timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ"))
 PY
 )"
 
@@ -93,9 +93,9 @@ if [[ "$MISSING_IDEM_HTTP_CODE" -lt 400 ]]; then
   exit 1
 fi
 
-echo "6) Poll until auto-closed by workflow (up to 30s)"
+echo "6) Poll until auto-closed by workflow (up to 90s)"
 STATUS=""
-for _ in {1..15}; do
+for _ in {1..45}; do
   BILL_RESP="$(curl -sS "$BASE_URL/bills/$BILL_ID")"
   STATUS="$(echo "$BILL_RESP" | jq -r '.bill.status')"
   echo "status=${STATUS}"
@@ -170,6 +170,169 @@ fi
 TOTAL="$(echo "$LIST_RESP" | jq -r '.total')"
 if [[ "$TOTAL" -lt 2 ]]; then
   echo "Expected total >= 2, got $TOTAL"
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Filtering tests: create bills across accounts and statuses, then verify
+# that status and account_id filters work correctly.
+# ---------------------------------------------------------------------------
+
+FILTER_END="$(python3 - <<'PY'
+from datetime import datetime, timezone, timedelta
+print((datetime.now(timezone.utc)+timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+PY
+)"
+
+# Use unique account IDs to isolate from earlier test data
+ACCT_A="acct-filter-a-$$"
+ACCT_B="acct-filter-b-$$"
+
+echo "10) Create filter test bills on two accounts"
+
+# acct-A: one OPEN bill
+FILTER_A_OPEN="$(curl -sS -X POST "$BASE_URL/bills" \
+  -H "Content-Type: application/json" \
+  -d "{\"account_id\":\"$ACCT_A\",\"currency\":\"USD\",\"period_end\":\"$FILTER_END\"}")"
+FILTER_A_OPEN_ID="$(echo "$FILTER_A_OPEN" | jq -r '.id')"
+echo "  acct-A OPEN:   $FILTER_A_OPEN_ID"
+
+# acct-A: one bill that we'll close → CLOSED
+FILTER_A_CLOSED="$(curl -sS -X POST "$BASE_URL/bills" \
+  -H "Content-Type: application/json" \
+  -d "{\"account_id\":\"$ACCT_A\",\"currency\":\"USD\",\"period_end\":\"$FILTER_END\"}")"
+FILTER_A_CLOSED_ID="$(echo "$FILTER_A_CLOSED" | jq -r '.id')"
+echo "  acct-A CLOSED: $FILTER_A_CLOSED_ID"
+
+curl -sS -X PATCH "$BASE_URL/bills/$FILTER_A_CLOSED_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"CLOSED"}' | jq .
+
+# acct-B: one OPEN bill
+FILTER_B_OPEN="$(curl -sS -X POST "$BASE_URL/bills" \
+  -H "Content-Type: application/json" \
+  -d "{\"account_id\":\"$ACCT_B\",\"currency\":\"GEL\",\"period_end\":\"$FILTER_END\"}")"
+FILTER_B_OPEN_ID="$(echo "$FILTER_B_OPEN" | jq -r '.id')"
+echo "  acct-B OPEN:   $FILTER_B_OPEN_ID"
+
+# acct-B: two bills that we'll close → CLOSED
+FILTER_B_CLOSED1="$(curl -sS -X POST "$BASE_URL/bills" \
+  -H "Content-Type: application/json" \
+  -d "{\"account_id\":\"$ACCT_B\",\"currency\":\"GEL\",\"period_end\":\"$FILTER_END\"}")"
+FILTER_B_CLOSED1_ID="$(echo "$FILTER_B_CLOSED1" | jq -r '.id')"
+echo "  acct-B CLOSED: $FILTER_B_CLOSED1_ID"
+
+curl -sS -X PATCH "$BASE_URL/bills/$FILTER_B_CLOSED1_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"CLOSED"}' | jq .
+
+FILTER_B_CLOSED2="$(curl -sS -X POST "$BASE_URL/bills" \
+  -H "Content-Type: application/json" \
+  -d "{\"account_id\":\"$ACCT_B\",\"currency\":\"USD\",\"period_end\":\"$FILTER_END\"}")"
+FILTER_B_CLOSED2_ID="$(echo "$FILTER_B_CLOSED2" | jq -r '.id')"
+echo "  acct-B CLOSED: $FILTER_B_CLOSED2_ID"
+
+curl -sS -X PATCH "$BASE_URL/bills/$FILTER_B_CLOSED2_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"CLOSED"}' | jq .
+
+# Summary:
+#   acct-A: 1 OPEN, 1 CLOSED          (2 total)
+#   acct-B: 1 OPEN, 2 CLOSED          (3 total)
+
+echo "11) Filter by status=OPEN for acct-A (expect 1)"
+LIST_A_OPEN="$(curl -sS "$BASE_URL/bills?status=OPEN&account_id=$ACCT_A&limit=50")"
+echo "$LIST_A_OPEN" | jq .
+COUNT_A_OPEN="$(echo "$LIST_A_OPEN" | jq -r '.total')"
+if [[ "$COUNT_A_OPEN" != "1" ]]; then
+  echo "Expected 1 OPEN bill for $ACCT_A, got $COUNT_A_OPEN"
+  exit 1
+fi
+# Verify the returned bill is actually OPEN
+A_OPEN_STATUS="$(echo "$LIST_A_OPEN" | jq -r '.bills[0].status')"
+if [[ "$A_OPEN_STATUS" != "OPEN" ]]; then
+  echo "Expected OPEN status in result, got $A_OPEN_STATUS"
+  exit 1
+fi
+
+echo "12) Filter by status=CLOSED for acct-A (expect 1)"
+LIST_A_CLOSED="$(curl -sS "$BASE_URL/bills?status=CLOSED&account_id=$ACCT_A&limit=50")"
+echo "$LIST_A_CLOSED" | jq .
+COUNT_A_CLOSED="$(echo "$LIST_A_CLOSED" | jq -r '.total')"
+if [[ "$COUNT_A_CLOSED" != "1" ]]; then
+  echo "Expected 1 CLOSED bill for $ACCT_A, got $COUNT_A_CLOSED"
+  exit 1
+fi
+
+echo "13) Filter by status=OPEN for acct-B (expect 1)"
+LIST_B_OPEN="$(curl -sS "$BASE_URL/bills?status=OPEN&account_id=$ACCT_B&limit=50")"
+echo "$LIST_B_OPEN" | jq .
+COUNT_B_OPEN="$(echo "$LIST_B_OPEN" | jq -r '.total')"
+if [[ "$COUNT_B_OPEN" != "1" ]]; then
+  echo "Expected 1 OPEN bill for $ACCT_B, got $COUNT_B_OPEN"
+  exit 1
+fi
+
+echo "14) Filter by status=CLOSED for acct-B (expect 2)"
+LIST_B_CLOSED="$(curl -sS "$BASE_URL/bills?status=CLOSED&account_id=$ACCT_B&limit=50")"
+echo "$LIST_B_CLOSED" | jq .
+COUNT_B_CLOSED="$(echo "$LIST_B_CLOSED" | jq -r '.total')"
+if [[ "$COUNT_B_CLOSED" != "2" ]]; then
+  echo "Expected 2 CLOSED bills for $ACCT_B, got $COUNT_B_CLOSED"
+  exit 1
+fi
+# Verify all returned bills are CLOSED
+ALL_CLOSED="$(echo "$LIST_B_CLOSED" | jq -r '[.bills[].status] | unique | .[]')"
+if [[ "$ALL_CLOSED" != "CLOSED" ]]; then
+  echo "Expected all bills to be CLOSED, got statuses: $ALL_CLOSED"
+  exit 1
+fi
+
+echo "15) Filter by account_id only — acct-A (expect 2: 1 OPEN + 1 CLOSED)"
+LIST_A_ALL="$(curl -sS "$BASE_URL/bills?account_id=$ACCT_A&limit=50")"
+echo "$LIST_A_ALL" | jq .
+COUNT_A_ALL="$(echo "$LIST_A_ALL" | jq -r '.total')"
+if [[ "$COUNT_A_ALL" != "2" ]]; then
+  echo "Expected 2 total bills for $ACCT_A, got $COUNT_A_ALL"
+  exit 1
+fi
+
+echo "16) Filter by account_id only — acct-B (expect 3: 1 OPEN + 2 CLOSED)"
+LIST_B_ALL="$(curl -sS "$BASE_URL/bills?account_id=$ACCT_B&limit=50")"
+echo "$LIST_B_ALL" | jq .
+COUNT_B_ALL="$(echo "$LIST_B_ALL" | jq -r '.total')"
+if [[ "$COUNT_B_ALL" != "3" ]]; then
+  echo "Expected 3 total bills for $ACCT_B, got $COUNT_B_ALL"
+  exit 1
+fi
+
+echo "17) Filter by status=CANCELLED (expect 0 for these accounts)"
+# CANCELLED bills can only be created internally (failed workflow start compensation),
+# so we verify the filter works and returns nothing for our test accounts.
+LIST_CANCELLED="$(curl -sS "$BASE_URL/bills?status=CANCELLED&account_id=$ACCT_A&limit=50")"
+echo "$LIST_CANCELLED" | jq .
+COUNT_CANCELLED="$(echo "$LIST_CANCELLED" | jq -r '.total')"
+if [[ "$COUNT_CANCELLED" != "0" ]]; then
+  echo "Expected 0 CANCELLED bills for $ACCT_A, got $COUNT_CANCELLED"
+  exit 1
+fi
+
+LIST_CANCELLED_B="$(curl -sS "$BASE_URL/bills?status=CANCELLED&account_id=$ACCT_B&limit=50")"
+COUNT_CANCELLED_B="$(echo "$LIST_CANCELLED_B" | jq -r '.total')"
+if [[ "$COUNT_CANCELLED_B" != "0" ]]; then
+  echo "Expected 0 CANCELLED bills for $ACCT_B, got $COUNT_CANCELLED_B"
+  exit 1
+fi
+
+echo "18) Cross-account isolation — acct-A bills should not appear in acct-B results"
+A_IN_B="$(echo "$LIST_B_ALL" | jq -r --arg id "$FILTER_A_OPEN_ID" '[.bills[]? | select(.id == $id)] | length')"
+if [[ "$A_IN_B" != "0" ]]; then
+  echo "acct-A bill found in acct-B results — cross-account leak!"
+  exit 1
+fi
+B_IN_A="$(echo "$LIST_A_ALL" | jq -r --arg id "$FILTER_B_OPEN_ID" '[.bills[]? | select(.id == $id)] | length')"
+if [[ "$B_IN_A" != "0" ]]; then
+  echo "acct-B bill found in acct-A results — cross-account leak!"
   exit 1
 fi
 

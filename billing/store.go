@@ -177,7 +177,6 @@ type listBillsParams struct {
 // listBills returns a filtered, paginated slice of bills and the total count.
 func listBills(ctx context.Context, p listBillsParams) ([]Bill, int, error) {
 	// Build WHERE clause dynamically with parameterised values.
-	// NOTE: hand-rolled arg-index tracking; consider squirrel or sqlc if filter count grows.
 	var where []string
 	var args []interface{}
 	argIdx := 1

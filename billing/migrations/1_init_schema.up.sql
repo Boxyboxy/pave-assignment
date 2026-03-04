@@ -2,7 +2,7 @@ CREATE TABLE bills (
   id UUID PRIMARY KEY,
   account_id TEXT NOT NULL,
   currency TEXT NOT NULL CHECK (currency IN ('USD', 'GEL')),
-  status TEXT NOT NULL CHECK (status IN ('OPEN', 'CLOSED', 'CANCELLED')),
+  status TEXT NOT NULL CHECK (status IN ('OPEN', 'CLOSED', 'CANCELLED')), -- first class concept, living in API -> types -> db
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   period_start TIMESTAMPTZ NOT NULL,
