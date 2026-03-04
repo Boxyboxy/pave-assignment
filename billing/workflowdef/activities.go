@@ -43,7 +43,7 @@ func NewActivities(closeBill CloseBillFunc, sendInvoice SendInvoiceFunc, persist
 }
 
 // ---------------------------------------------------------------------------
-// Activity: MarkClosedInDB
+// Activity: MarkClosedInDB wrapper
 // ---------------------------------------------------------------------------
 
 // MarkClosedInDB transitions a bill to CLOSED via the injected CloseBillFunc.
@@ -59,7 +59,7 @@ func (a *Activities) MarkClosedInDB(ctx context.Context, billID string) error {
 }
 
 // ---------------------------------------------------------------------------
-// Activity: SendInvoiceEmail
+// Activity: SendInvoiceEmail wrapper
 // ---------------------------------------------------------------------------
 
 // SendInvoiceEmail sends the invoice via the injected SendInvoiceFunc.
@@ -75,7 +75,7 @@ func (a *Activities) SendInvoiceEmail(ctx context.Context, billID string) error 
 }
 
 // ---------------------------------------------------------------------------
-// Activity: PersistLineItem
+// Activity: PersistLineItem wrapper
 // ---------------------------------------------------------------------------
 
 // PersistLineItem delegates to the injected PersistLineItemFunc and maps
